@@ -1,7 +1,7 @@
 from pyspark.sql import SparkSession
 from pyspark.sql import functions as F
 from pyspark.sql.window import Window
-from pyspark.sql.functions import col, count, when, round, desc
+from pyspark.sql.types import StringType
 
 
 # Create a Spark session
@@ -73,36 +73,29 @@ def task1_largest_discrepancy(flights_df, carriers_df):
 def task2_consistent_airlines(flights_df, carriers_df):
     # TODO: Implement the SQL query for Task 2
     # Hint: Calculate standard deviation of departure delays, filter airlines with more than 100 flights.
+    # Calculate departure delay
+    flights_df = flights_df.withColumn(
+        "DepartureDelay", F.unix_timestamp("ActualDeparture") - F.unix_timestamp("ScheduledDeparture")
+    )
 
-    # Calculate departure delay and cast to numeric type
-    flights_with_delay = flights_df.withColumn(
-        "DepartureDelay",
-        (F.col("ActualDeparture").cast("long") - F.col("ScheduledDeparture").cast("long")) / 60.0  # Delay in minutes
-    ).filter(
-        F.col("DepartureDelay").isNotNull()  # Filter out null or missing delays
+    # Group by carrier and calculate standard deviation of departure delays
+    carrier_delay_stats = flights_df.groupBy("CarrierCode").agg(
+        F.count("FlightNum").alias("FlightCount"),
+        F.stddev("DepartureDelay").alias("StdDevDepartureDelay")
     )
-    
-    # Group by CarrierCode and calculate metrics
-    carrier_stats = flights_with_delay.groupBy("CarrierCode").agg(
-        F.count("*").alias("NumFlights"),  # Count of flights
-        F.stddev("DepartureDelay").alias("StdDevDelay")  # Standard deviation of delays
-    ).filter(
-        F.col("NumFlights") > 100  # Only consider carriers with more than 100 flights
-    ).orderBy("StdDevDelay")  # Order by consistency (lower StdDevDelay is better)
-    
-    # Join with carriers to get carrier names
-    consistent_airlines = carrier_stats.alias("cs").join(
-        carriers_df.alias("c"),
-        F.col("cs.CarrierCode") == F.col("c.CarrierCode"),
-        "left"
-    ).select(
-        F.col("c.CarrierName").alias("Airline"),
-        F.col("cs.NumFlights"),
-        F.col("cs.StdDevDelay").alias("StandardDeviationDelay")
-    )
-    
-    # Write the result to a CSV file
-    consistent_airlines.write.csv(task2_output, header=True, mode="overwrite")
+
+    # Filter carriers with more than 100 flights
+    carrier_delay_stats = carrier_delay_stats.filter(carrier_delay_stats["FlightCount"] > 100)
+
+    # Join with carrier names
+    carrier_delay_stats = carrier_delay_stats.join(carriers_df, on="CarrierCode", how="inner")
+
+    # Select and rank by standard deviation of departure delays
+    result = carrier_delay_stats.select(
+        "CarrierName", "FlightCount", "StdDevDepartureDelay"
+    ).orderBy("StdDevDepartureDelay")
+
+    result.write.csv(task2_output, header=True, mode="overwrite")
 
     print(f"Task 2 output written to {task2_output}")
 
@@ -151,37 +144,38 @@ def task3_canceled_routes(flights_df, airports_df):
 def task4_carrier_performance_time_of_day(flights_df, carriers_df):
     # TODO: Implement the SQL query for Task 4
     # Hint: Create time of day groups and calculate average delay for each carrier within each group.
-     # Define the time of day based on ScheduledDeparture
-    flights_with_time_of_day = flights_df.withColumn(
-        "TimeOfDay", F.when((F.col("ScheduledDeparture").substr(12, 2).cast("int") >= 6) & 
-                            (F.col("ScheduledDeparture").substr(12, 2).cast("int") < 12), "Morning")
-        .when((F.col("ScheduledDeparture").substr(12, 2).cast("int") >= 12) & 
-              (F.col("ScheduledDeparture").substr(12, 2).cast("int") < 18), "Afternoon")
-        .when((F.col("ScheduledDeparture").substr(12, 2).cast("int") >= 18) & 
-              (F.col("ScheduledDeparture").substr(12, 2).cast("int") < 24), "Evening")
-        .otherwise("Night")
-    )
-    
-    # Calculate the departure delay 
-    flights_with_time_of_day = flights_with_time_of_day.withColumn(
-        "DepartureDelay", 
-        F.when(F.col("ActualDeparture").isNotNull(),
-               (F.unix_timestamp("ActualDeparture") - F.unix_timestamp("ScheduledDeparture")).cast("int"))
-        .otherwise(None)  # or 0 if you prefer
-    )
-    
-    # Calculate average delay for each carrier and time of day
-    performance_stats = flights_with_time_of_day.groupBy("CarrierCode", "TimeOfDay").agg(
-        F.avg("DepartureDelay").alias("AvgDelay")
-    ).orderBy("TimeOfDay", "AvgDelay")
+     # Create time of day group
+    def time_of_day(hour):
+        if 6 <= hour < 12:
+            return "Morning"
+        elif 12 <= hour < 18:
+            return "Afternoon"
+        elif 18 <= hour < 24:
+            return "Evening"
+        else:
+            return "Night"
 
-    # Join with carriers for names
-    enriched_performance = performance_stats.join(
-        carriers_df, performance_stats["CarrierCode"] == carriers_df["CarrierCode"], "left"
-    ).select("CarrierName", "TimeOfDay", "AvgDelay")
-    
-    # Write the result to CSV
-    enriched_performance.write.csv(task4_output, header=True, mode="overwrite")
+    time_of_day_udf = F.udf(time_of_day, StringType())
+    flights_df = flights_df.withColumn("TimeOfDay", time_of_day_udf(F.hour("ScheduledDeparture")))
+
+    # Calculate departure delay
+    flights_df = flights_df.withColumn(
+        "DepartureDelay", F.unix_timestamp("ActualDeparture") - F.unix_timestamp("ScheduledDeparture")
+    )
+
+    # Group by carrier and time of day to calculate average delay
+    carrier_time_of_day = flights_df.groupBy("CarrierCode", "TimeOfDay").agg(
+        F.avg("DepartureDelay").alias("AvgDepartureDelay")
+    )
+
+    # Join with carrier names
+    carrier_time_of_day = carrier_time_of_day.join(carriers_df, on="CarrierCode", how="inner")
+
+    result = carrier_time_of_day.select(
+        "CarrierName", "TimeOfDay", "AvgDepartureDelay"
+    ).orderBy("TimeOfDay", "AvgDepartureDelay")
+
+    result.write.csv(task4_output, header=True, mode="overwrite")
 
     print(f"Task 4 output written to {task4_output}")
 
